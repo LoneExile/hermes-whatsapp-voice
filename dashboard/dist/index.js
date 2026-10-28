@@ -18,10 +18,11 @@
   // Settings are grouped here; any key not listed lands in Advanced.
   const GROUPS = [
     { title: "You", keys: ["owner_number"] },
-    { title: "Voice", keys: ["voice_model", "voice", "assistant_name", "languages", "voice_instructions"] },
-    { title: "Calls", keys: ["ring_timeout_seconds", "max_call_minutes", "silence_hangup_seconds", "answer_inbound", "send_summary"] },
+    { title: "Voice", keys: ["voice_model", "voice", "assistant_name", "languages", "speech_language", "vocabulary", "voice_instructions"] },
+    { title: "Chat context", keys: ["context_mode", "history_chars", "voice_tools"] },
+    { title: "Calls", keys: ["ring_timeout_seconds", "max_call_minutes", "silence_hangup_seconds", "pause_before_reply_ms", "hangup_grace_seconds", "hermes_timeout_seconds", "max_silent_tools", "answer_inbound", "send_summary", "record_calls"] },
   ];
-  const WIDE = ["voice_instructions", "live_config"];
+  const WIDE = ["voice_instructions", "voice_tools", "live_config"];
 
   function Card(props, ...children) {
     return h(
@@ -228,7 +229,9 @@
       );
     }
     let input;
-    if (type === "dict") {
+    if (spec.choices) {
+      input = h("select", { className: "hwv-select", value, onChange: (e) => onChange(e.target.value) }, ...spec.choices.map((c) => h("option", { key: c, value: c }, c || "(automatic)")));
+    } else if (type === "dict") {
       input = h("textarea", { className: "hwv-textarea is-code", spellCheck: false, value, onChange: (e) => onChange(e.target.value) });
     } else if (name === "voice_instructions") {
       input = h("textarea", { className: "hwv-textarea", value: value || "", onChange: (e) => onChange(e.target.value) });

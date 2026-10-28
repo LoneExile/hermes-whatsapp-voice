@@ -13,19 +13,31 @@ Restart the sidecar after a change: the dashboard's **Restart sidecar** button, 
 
 | key | default | |
 |---|---|---|
+| `context_mode` | `separate` | `separate`: a small voice agent with a short briefing that asks Hermes through `ask_hermes`. `core_session`: the voice is the model of your WhatsApp chat with Hermes (see below); costs several times more per call |
 | `owner_number` | (required) | Your number, international format |
 | `voice_model` | `gemini-3.8-live` | Gemini Live model |
 | `voice` | `Kore` | Gemini prebuilt voice |
 | `assistant_name` | `Hermes` | Fallback name when Hermes gives no persona briefing |
-| `languages` | (empty) | Language codes the voice may speak and listen for, e.g. `en-US, ta-IN`; empty allows any |
+| `languages` | (empty) | Language codes the voice may speak, e.g. `en-US, ta-IN`. Speech recognition only takes them as hints; set `speech_language` too if it mishears your language |
+| `speech_language` | (automatic) | Your main spoken language, one code (e.g. `ta-IN`). Gemini uses it for recognising your speech and for its voice; much stronger than `languages`, which are only hints |
 | `voice_instructions` | (empty) | Your own extra rules for the voice: language, tone, call length |
+| `vocabulary` | (empty) | Words transcripts should spell as given, e.g. names; your own name is added automatically |
+| `voice_tools` | memory, skills, web, file reading, Hindsight… | `core_session`: tools the voice uses itself for quick lookups (only those your chat has); real jobs go to your main model |
+| `history_chars` | `30000` | `core_session`: recent chat history given to the voice at call start |
 | `live_config` | `{}` | Advanced: any Gemini Live setup field, merged over the defaults (see below) |
 | `ring_timeout_seconds` | `45` | How long an outbound call rings |
 | `max_call_minutes` | `15` | Hard cap per call |
 | `silence_hangup_seconds` | `180` | End a call when nobody has spoken for this long (e.g. left on hold) |
+| `pause_before_reply_ms` | `600` | How long you can pause before the voice takes your turn as over and replies; raise it if it cuts you off |
+| `hangup_grace_seconds` | `3` | Quiet time after the assistant's goodbye before it hangs up; speaking in it keeps the call up |
+| `hermes_timeout_seconds` | `180` | How long the voice waits for Hermes on one request, and for the call summary |
+| `max_silent_tools` | `5` | Tools the voice may run in a row before it must tell you what it is doing |
+| `record_calls` | `false` | Save your side of each call as `recordings/<call id>.wav` in the plugin's data folder (this machine only) |
 | `answer_inbound` | `true` | Answer calls from `owner_number` |
 | `send_summary` | `true` | Message a summary after each call |
 | `listen` | `127.0.0.1:8796` | Sidecar API address (loopback) |
+| `context_listen` | `127.0.0.1:8797` | `core_session` service address (loopback) |
+| `voice_api_url` | Gemini Live endpoint | Advanced: the Live API WebSocket URL, for a proxy. The Gemini key is sent there |
 | `hermes_api_url` | `http://127.0.0.1:8642` | Hermes API server |
 
 **Every Gemini Live option.** `live_config` takes any field of the Live API's setup message and
@@ -69,6 +81,33 @@ you. The voice then sounds like your Hermes, and changes to Hermes's memory carr
 hermes config set plugins.entries.hermes-whatsapp-voice.settings.voice_instructions \
   "Keep calls very short and direct. Never ask if there is anything else."
 ```
+
+## Core-session mode
+
+With `context_mode: core_session`, `hermes whatsapp-voice serve` also runs a small
+loopback service in Hermes's own interpreter, and each call becomes part of your WhatsApp DM
+session with Hermes:
+
+- **Context:** the voice gets that session's stored system prompt (persona, memory, skills), its
+  session context, and recent history (`history_chars`), loaded before the call starts.
+- **Tools:** the voice handles quick lookups itself with `voice_tools` (no terminal or changes by
+  default), run through Hermes in that session. Real jobs go to `ask_hermes_deep`: a full normal turn
+  of your main model, with all of its tools, in the same session; the voice keeps talking and tells
+  you the outcome. When a command needs approval, the voice asks you and answers with `approve_command`.
+- **Write-back:** what you and the voice say, and its tool calls, are saved into the session as the
+  call goes (marked `display_kind: voice_call`), under Hermes's cross-process turn lock, so your next
+  text message continues with the call in context.
+- **Texts during a call** go into the call: the voice answers them, and the text agent stays quiet
+  (a gateway hook; slash commands, media and other chats are unaffected). Needs a gateway restart
+  after installing or updating the plugin.
+
+**Cost:** a live voice model re-reads its whole context on every reply. In this mode that context is
+the chat's system prompt, tool schemas and up to `history_chars` of history, so a call costs several
+times more than with `separate`. Each call record shows the tokens the voice model used (`usage`).
+
+It uses Hermes internals that are not part of the plugin API (listed in `CORE_PATCHES.md`); if the
+service is unavailable, a call falls back to the separate voice agent. It needs a WhatsApp DM
+session with the bot to exist (send it one text first).
 
 ## Credentials
 

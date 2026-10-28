@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -38,7 +38,7 @@ async fn health(State(bridge): State<Arc<Bridge>>, headers: HeaderMap) -> ApiRes
     Ok(Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
-        "logged_in": bridge.client.is_logged_in(),
+        "logged_in": bridge.client.as_ref().is_some_and(|c| c.is_logged_in()),
         "active_call": bridge.calls.active(),
         "hermes_connected": !bridge.cfg.hermes_api_key.is_empty(),
     }))
@@ -62,7 +62,7 @@ async fn start_call(
     if reason.is_empty() {
         return Err(error(StatusCode::BAD_REQUEST, "reason is required"));
     }
-    if !bridge.client.is_logged_in() {
+    if !bridge.client.as_ref().is_some_and(|c| c.is_logged_in()) {
         return Err(error(
             StatusCode::SERVICE_UNAVAILABLE,
             "not connected to WhatsApp",
@@ -77,6 +77,25 @@ async fn start_call(
         body.details.trim().to_string(),
     ));
     Ok((StatusCode::ACCEPTED, Json(record)).into_response())
+}
+
+#[derive(Deserialize)]
+struct CallText {
+    text: String,
+}
+
+/// A WhatsApp text from the owner, for the active call (the plugin's gateway hook sends it).
+async fn call_text(
+    State(bridge): State<Arc<Bridge>>,
+    headers: HeaderMap,
+    Json(body): Json<CallText>,
+) -> ApiResult {
+    authorize(&bridge, &headers)?;
+    let text = body.text.trim();
+    if text.is_empty() || !bridge.deliver_text(text) {
+        return Err(error(StatusCode::NOT_FOUND, "no active call takes texts"));
+    }
+    Ok(Json(json!({"delivered": true})).into_response())
 }
 
 #[derive(Deserialize)]
@@ -111,6 +130,7 @@ pub async fn serve(bridge: Arc<Bridge>) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/calls", get(list_calls).post(start_call))
+        .route("/calls/active/text", post(call_text))
         .route("/calls/{id}", get(get_call))
         .with_state(bridge);
     let listener = tokio::net::TcpListener::bind(&addr).await?;

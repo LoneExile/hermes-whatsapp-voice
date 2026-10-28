@@ -13,6 +13,8 @@ pub struct Config {
     pub listen: String,
     pub token: String,
     pub gemini_api_key: String,
+    /// Live API WebSocket endpoint (a proxy, or a local fake in tests).
+    pub gemini_url: String,
     pub model: String,
     pub voice: String,
     pub assistant_name: String,
@@ -20,6 +22,10 @@ pub struct Config {
     pub voice_instructions: String,
     /// Language codes (e.g. en-US) the voice may use; empty means any.
     pub languages: Vec<String>,
+    /// The owner's main spoken language (one code, e.g. ta-IN); empty leaves it to Gemini.
+    pub speech_language: String,
+    /// Owner pause (ms) that ends their turn.
+    pub pause_ms: u32,
     /// Raw Gemini Live setup fields (JSON object) merged over the defaults.
     pub live_config: serde_json::Value,
     pub hermes_api_url: String,
@@ -33,8 +39,26 @@ pub struct Config {
     pub max_duration: Duration,
     /// End a call after this long with nobody speaking.
     pub silence_timeout: Duration,
+    /// Quiet time after the assistant's goodbye before it hangs up.
+    pub hangup_grace: Duration,
+    /// Tool calls the model may make in a row before it must speak to the owner.
+    pub max_silent_tools: u32,
+    /// Where each call's owner audio is saved as a WAV file; None turns recording off.
+    pub recordings: Option<PathBuf>,
     pub answer_inbound: bool,
     pub send_summary: bool,
+    /// Where the plugin's core-session service listens; empty means the separate-agent mode
+    /// (persona briefing + ask_hermes) instead of acting as the owner's DM session.
+    pub context_url: String,
+    /// Words transcription should spell as given (names).
+    pub vocabulary: Vec<String>,
+}
+
+pub(crate) fn list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -109,15 +133,16 @@ impl Config {
             listen,
             token: required("HWV_TOKEN")?,
             gemini_api_key: required("GEMINI_API_KEY")?,
+            gemini_url: var("HWV_GEMINI_URL", crate::gemini::ENDPOINT),
             model: var("HWV_MODEL", "gemini-3.8-live"),
             voice: var("HWV_VOICE", "Kore"),
             assistant_name: var("HWV_ASSISTANT_NAME", "Hermes"),
             voice_instructions: var("HWV_VOICE_INSTRUCTIONS", ""),
-            languages: var("HWV_LANGUAGES", "")
-                .split(',')
-                .map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty())
-                .collect(),
+            languages: list(&var("HWV_LANGUAGES", "")),
+            speech_language: var("HWV_SPEECH_LANGUAGE", "").trim().to_string(),
+            pause_ms: var("HWV_PAUSE_MS", "600")
+                .parse()
+                .context("HWV_PAUSE_MS must be a whole number of milliseconds")?,
             live_config: live_config(&var("HWV_LIVE_CONFIG", "{}"))?,
             hermes_api_url: var("HERMES_API_URL", "http://127.0.0.1:8642")
                 .trim_end_matches('/')
@@ -127,8 +152,17 @@ impl Config {
             ring_timeout: parse_duration(&var("HWV_RING_TIMEOUT", "45s"))?,
             max_duration: parse_duration(&var("HWV_MAX_DURATION", "15m"))?,
             silence_timeout: parse_duration(&var("HWV_SILENCE_TIMEOUT", "180s"))?,
+            hangup_grace: parse_duration(&var("HWV_HANGUP_GRACE", "3s"))?,
+            max_silent_tools: var("HWV_MAX_SILENT_TOOLS", "5")
+                .parse()
+                .context("HWV_MAX_SILENT_TOOLS must be a whole number")?,
+            recordings: (var("HWV_RECORD_CALLS", "false") == "true")
+                .then(|| Self::data_dir().map(|d| d.join("recordings")))
+                .transpose()?,
             answer_inbound: var("HWV_ANSWER_INBOUND", "true") == "true",
             send_summary: var("HWV_SEND_SUMMARY", "true") == "true",
+            context_url: var("HWV_CONTEXT_URL", "").trim_end_matches('/').to_string(),
+            vocabulary: list(&var("HWV_VOCABULARY", "")),
         })
     }
 

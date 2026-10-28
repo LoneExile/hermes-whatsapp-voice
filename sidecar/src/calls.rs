@@ -16,8 +16,9 @@ use whatsapp_rust::prelude::*;
 use whatsapp_rust::voip::{CallHandle, CallTermination};
 use whatsapp_rust::wacore::types::call::IncomingCall;
 
-use crate::audio::{Downsampler, Playout};
+use crate::audio::{Downsampler, Playout, WavWriter};
 use crate::config::Config;
+use crate::core::{self, Core};
 use crate::gemini::{Live, LiveEvent, Setup};
 use crate::hermes::Hermes;
 
@@ -25,6 +26,68 @@ const KEEP_RECORDS: usize = 50;
 const FRAME_INTERVAL: Duration = Duration::from_millis(60);
 const STILL_CONNECTED: &str = "(The call is still connected: the owner spoke after your goodbye. \
     Answer them, and call end_call again once they are done.)";
+
+/// What a call is about, for the core session.
+pub(crate) struct CallInfo {
+    direction: &'static str,
+    reason: String,
+    details: String,
+    /// First prompt to the model, and the call context for the separate-agent prompt.
+    opening: String,
+    context: String,
+}
+
+impl CallInfo {
+    fn inbound() -> Self {
+        Self {
+            direction: "inbound",
+            reason: String::new(),
+            details: String::new(),
+            opening:
+                "(The owner is calling you and is now connected. Say hi briefly, the way you usually \
+                talk with them.)"
+                    .into(),
+            context: "The owner called you.".into(),
+        }
+    }
+
+    fn outbound(reason: String, details: String) -> Self {
+        let opening = format!(
+            "(The owner just answered the call you placed. Say hi the way you usually talk with them, \
+             then get to the point: {reason})"
+        );
+        let mut context = format!("You placed this call. Reason: {reason}");
+        if !details.is_empty() {
+            context.push_str(&format!("\nDetails: {details}"));
+        }
+        Self {
+            direction: "outbound",
+            reason,
+            details,
+            opening,
+            context,
+        }
+    }
+}
+
+/// The phone side of a call: the WhatsApp call, or a fake phone in tests.
+pub(crate) trait Line {
+    /// Resolves once the other side hangs up or the line drops.
+    fn ended(&self) -> impl Future<Output = ()> + Send;
+    fn hang_up(&self) -> impl Future<Output = ()> + Send;
+}
+
+impl Line for CallHandle {
+    fn ended(&self) -> impl Future<Output = ()> + Send {
+        self.wait_ended()
+    }
+
+    fn hang_up(&self) -> impl Future<Output = ()> + Send {
+        terminate(self)
+    }
+}
+
+type ToolDone = (String, String, Value);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +119,79 @@ pub struct CallRecord {
     pub end_reason: Option<String>,
     pub transcript: Vec<Turn>,
     pub summary: Option<String>,
+    pub metrics: Metrics,
+}
+
+/// How a call went, as the sidecar measured it: what the call tests check, and what to read after
+/// a real call that went wrong.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Metrics {
+    /// From answer to the model's first audio.
+    pub first_audio_ms: Option<u64>,
+    /// Each time the owner spoke: how long until the model's next audio.
+    pub reply_ms: Vec<u64>,
+    /// Longest stretch with nobody speaking (the owner, or model speech still playing).
+    pub longest_silence_ms: u64,
+    pub tool_calls: u32,
+    /// Most tool calls the model made in a row without saying anything.
+    pub max_silent_tools: u32,
+    /// Who ended the call: phone (the owner hung up or the line dropped), assistant, silence,
+    /// limit, voice_model or error.
+    pub ended_by: &'static str,
+    /// Tokens the voice model billed for the call, summed over its responses.
+    pub prompt_tokens: u64,
+    pub response_tokens: u64,
+}
+
+/// Fills `Metrics` from the call's events as they happen.
+struct Timeline {
+    m: Metrics,
+    answered: Instant,
+    last_sound: Instant,
+    owner_spoke_at: Option<Instant>,
+    silent_tools: u32,
+}
+
+impl Timeline {
+    fn new(answered: Instant) -> Self {
+        Self {
+            m: Metrics::default(),
+            answered,
+            last_sound: answered,
+            owner_spoke_at: None,
+            silent_tools: 0,
+        }
+    }
+
+    fn sound(&mut self, now: Instant) {
+        let gap = now.duration_since(self.last_sound).as_millis() as u64;
+        self.m.longest_silence_ms = self.m.longest_silence_ms.max(gap);
+        self.last_sound = now;
+    }
+
+    fn owner_spoke(&mut self, now: Instant) {
+        self.sound(now);
+        self.owner_spoke_at = Some(now);
+    }
+
+    fn model_audio(&mut self, now: Instant) {
+        self.sound(now);
+        let ms = |since: Instant| now.duration_since(since).as_millis() as u64;
+        self.m.first_audio_ms.get_or_insert(ms(self.answered));
+        if let Some(asked) = self.owner_spoke_at.take() {
+            self.m.reply_ms.push(ms(asked));
+        }
+    }
+
+    fn model_spoke(&mut self) {
+        self.silent_tools = 0;
+    }
+
+    fn tool(&mut self) {
+        self.m.tool_calls += 1;
+        self.silent_tools += 1;
+        self.m.max_silent_tools = self.m.max_silent_tools.max(self.silent_tools);
+    }
 }
 
 fn now() -> u64 {
@@ -82,6 +218,7 @@ impl CallRecord {
             end_reason: None,
             transcript: Vec::new(),
             summary: None,
+            metrics: Metrics::default(),
         }
     }
 
@@ -228,8 +365,46 @@ impl RingSignals {
 /// language). The model ends the call itself, after the owner's goodbye; the sidecar hangs up once
 /// that goodbye has finished playing and a short quiet window passes. Any owner speech in the window
 /// calls the hangup off. A long silence ends a call nobody closed (or left on hold too long).
+/// Keeps the model talking while it works: after a few tool calls in silence it must speak to the
+/// owner before running more, and it must report what its tools did before hanging up.
+struct Pacing {
+    limit: u32,
+    silent_tools: u32,
+    owes_report: bool,
+}
+
+impl Pacing {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            silent_tools: 0,
+            owes_report: false,
+        }
+    }
+
+    fn spoke(&mut self) {
+        self.silent_tools = 0;
+        self.owes_report = false;
+    }
+
+    /// False when the model must talk to the owner before another tool runs.
+    fn allow_tool(&mut self) -> bool {
+        if self.silent_tools >= self.limit {
+            return false;
+        }
+        self.silent_tools += 1;
+        true
+    }
+
+    fn result_sent(&mut self) {
+        self.owes_report = true;
+    }
+}
+
 struct Ending {
     silence: Duration,
+    /// Quiet time after the goodbye before hanging up.
+    grace: Duration,
     requested: bool,
     /// When playback went quiet after end_call.
     quiet_since: Option<Instant>,
@@ -237,11 +412,10 @@ struct Ending {
 }
 
 impl Ending {
-    const GRACE: Duration = Duration::from_secs(3);
-
-    fn new(silence: Duration) -> Self {
+    fn new(silence: Duration, grace: Duration) -> Self {
         Self {
             silence,
+            grace,
             requested: false,
             quiet_since: None,
             last_activity: None,
@@ -268,7 +442,7 @@ impl Ending {
             self.quiet_since = None;
             return None;
         }
-        if self.requested && now.duration_since(*self.quiet_since.get_or_insert(now)) >= Self::GRACE
+        if self.requested && now.duration_since(*self.quiet_since.get_or_insert(now)) >= self.grace
         {
             return Some("assistant ended the call");
         }
@@ -280,16 +454,19 @@ impl Ending {
 
 pub struct Bridge {
     pub cfg: Config,
-    pub client: Arc<Client>,
+    /// None in tests, which drive calls without WhatsApp.
+    pub client: Option<Arc<Client>>,
     pub calls: Calls,
     pub ring_signals: RingSignals,
     hermes: Option<Hermes>,
     /// Hermes's own briefing on who it is and who the owner is; empty until fetched.
     persona: Mutex<String>,
+    /// Core session: where texts the owner sends during the call go (None when no call).
+    texts: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 impl Bridge {
-    pub fn new(cfg: Config, client: Arc<Client>) -> Self {
+    pub fn new(cfg: Config, client: Option<Arc<Client>>) -> Self {
         let hermes = (!cfg.hermes_api_key.is_empty())
             .then(|| Hermes::new(&cfg.hermes_api_url, &cfg.hermes_api_key));
         Self {
@@ -299,7 +476,17 @@ impl Bridge {
             hermes,
             ring_signals: RingSignals::default(),
             persona: Mutex::default(),
+            texts: Mutex::default(),
         }
+    }
+
+    /// Hands a WhatsApp text from the owner to the active core-session call; false if none.
+    pub fn deliver_text(&self, text: &str) -> bool {
+        self.texts
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|tx| tx.send(text.to_string()).is_ok())
     }
 
     /// Rings until the owner answers (true) or the call is declined, ends, or times out (false,
@@ -361,9 +548,12 @@ impl Bridge {
                 return jid.user == self.cfg.owner;
             }
         }
+        let Some(client) = &self.client else {
+            return false;
+        };
         for jid in [creator, &call.from] {
             if jid.is_lid()
-                && let Ok(Some(entry)) = self.client.get_lid_pn_entry(jid).await
+                && let Ok(Some(entry)) = client.get_lid_pn_entry(jid).await
             {
                 return *entry.phone_number == *self.cfg.owner;
             }
@@ -380,11 +570,15 @@ impl Bridge {
     }
 
     pub async fn run_outbound(self: Arc<Self>, id: String, reason: String, details: String) {
+        let Some(client) = self.client.clone() else {
+            return self
+                .calls
+                .finish(&id, Status::Failed, "WhatsApp is not connected");
+        };
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(8);
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
         self.ring_signals.start();
-        let started = self
-            .client
+        let started = client
             .voip()
             .call(&self.owner_jid())
             .audio(mic_rx, spk_tx)
@@ -408,27 +602,21 @@ impl Bridge {
         let (Ok(handle), true) = (started, answered) else {
             return;
         };
-
-        let opening = format!(
-            "(The owner just answered the call you placed. Greet them and get to the point: {reason})"
-        );
-        let mut context = format!("You placed this call. Reason: {reason}");
-        if !details.is_empty() {
-            context.push_str(&format!("\nDetails: {details}"));
-        }
-        self.converse(&id, handle, mic_tx, spk_rx, &opening, &context)
-            .await;
+        let info = CallInfo::outbound(reason, details);
+        self.converse(&id, &handle, mic_tx, spk_rx, info).await;
     }
 
     pub async fn run_inbound(self: Arc<Self>, call: IncomingCall) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         let record = match self.calls.begin("inbound", "owner called") {
             Ok(r) => r,
             Err(e) => return log::info!("ignoring owner call: {e}"),
         };
         let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(8);
         let (spk_tx, spk_rx) = async_channel::bounded::<Vec<i16>>(64);
-        let handle = match self
-            .client
+        let handle = match client
             .voip()
             .accept(&call)
             .audio(mic_rx, spk_tx)
@@ -449,21 +637,17 @@ impl Bridge {
             record.id,
             handle.call_id()
         );
-        let opening = "(The owner is calling you and is now connected. Greet them briefly and ask what they need.)";
-        self.converse(
-            &record.id,
-            handle,
-            mic_tx,
-            spk_rx,
-            opening,
-            "The owner called you.",
-        )
-        .await;
+        self.converse(&record.id, &handle, mic_tx, spk_rx, CallInfo::inbound())
+            .await;
     }
 
     /// Asks Hermes for a short briefing so the voice model shares its name, persona and memory.
     /// Fetched ahead of time so answering a call never waits on it.
     pub async fn refresh_persona(&self) {
+        // In core-session mode the voice gets the session's own prompt instead.
+        if !self.cfg.context_url.is_empty() {
+            return;
+        }
         let Some(h) = &self.hermes else { return };
         let prompt = "A voice version of you is about to talk with the owner on a WhatsApp call, and it \
             knows only what you write here. In under 150 words of plain sentences, tell it: your name and \
@@ -518,11 +702,7 @@ impl Bridge {
             tools_note,
             context,
         );
-        let mut functions = vec![json!({
-            "name": "end_call",
-            "description": "Hang up the call. Call it only after you have said goodbye.",
-            "behavior": "NON_BLOCKING",
-        })];
+        let mut functions = vec![end_call_function()];
         if self.hermes.is_some() {
             functions.push(json!({
                 "name": "ask_hermes",
@@ -546,7 +726,70 @@ impl Bridge {
             system_instruction,
             functions,
             languages: self.cfg.languages.clone(),
+            speech_language: self.cfg.speech_language.clone(),
+            pause_ms: self.cfg.pause_ms,
             overrides: self.cfg.live_config.clone(),
+            history: vec![],
+            vocabulary: self.cfg.vocabulary.clone(),
+        }
+    }
+
+    /// Setup when the voice acts as the owner's DM session: that session's prompt, history and tools.
+    fn core_setup(&self, ctx: core::CallContext) -> Setup {
+        let mut functions = ctx.functions;
+        functions.push(end_call_function());
+        functions.extend(core::bridge_functions());
+        let mut vocabulary = self.cfg.vocabulary.clone();
+        vocabulary.extend(ctx.vocabulary);
+        vocabulary.sort();
+        vocabulary.dedup();
+        Setup {
+            model: self.cfg.model.clone(),
+            voice: self.cfg.voice.clone(),
+            system_instruction: ctx.system_instruction,
+            functions,
+            languages: self.cfg.languages.clone(),
+            speech_language: self.cfg.speech_language.clone(),
+            pause_ms: self.cfg.pause_ms,
+            overrides: self.cfg.live_config.clone(),
+            history: ctx.history,
+            vocabulary,
+        }
+    }
+
+    /// Opens the core session for a call; None (separate-agent mode) if it is off or unavailable.
+    async fn start_core(&self, id: &str, info: &CallInfo) -> Option<(Core, core::CallContext)> {
+        if self.cfg.context_url.is_empty() {
+            return None;
+        }
+        let core = Core::new(&self.cfg.context_url, &self.cfg.token, id);
+        let started = Instant::now();
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            core.start(info.direction, &info.reason, &info.details),
+        )
+        .await
+        {
+            Ok(Ok(ctx)) => {
+                log::info!(
+                    "call {id}: core session {} loaded in {:.2}s ({} history turns, {} tools)",
+                    ctx.session_id,
+                    started.elapsed().as_secs_f32(),
+                    ctx.history.len(),
+                    ctx.functions.len()
+                );
+                Some((core, ctx))
+            }
+            Ok(Err(e)) => {
+                log::warn!(
+                    "call {id}: core session unavailable ({e:#}); using the separate voice agent"
+                );
+                None
+            }
+            Err(_) => {
+                log::warn!("call {id}: core session timed out; using the separate voice agent");
+                None
+            }
         }
     }
 
@@ -555,7 +798,7 @@ impl Bridge {
         id: &str,
         call_id: &str,
         args: &Value,
-        done: mpsc::UnboundedSender<(String, Value)>,
+        done: mpsc::UnboundedSender<ToolDone>,
     ) -> JoinHandle<()> {
         let hermes = self.hermes.clone();
         let hermes_timeout = self.cfg.hermes_timeout;
@@ -577,36 +820,66 @@ impl Bridge {
                     }
                 }
             };
-            let _ = done.send((tool_id, result));
+            let _ = done.send((tool_id, "ask_hermes".to_string(), result));
         })
     }
 
-    async fn converse(
+    pub(crate) async fn converse(
         &self,
         id: &str,
-        handle: CallHandle,
+        line: &impl Line,
         mic_tx: async_channel::Sender<Vec<i16>>,
         spk_rx: async_channel::Receiver<Vec<i16>>,
-        opening: &str,
-        context: &str,
+        info: CallInfo,
     ) {
         self.calls.update(id, |r| {
             r.status = Status::InProgress;
             r.answered_at = Some(now());
         });
-        let mut live = match Live::connect(&self.cfg.gemini_api_key, self.setup(context)).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::error!("call {id}: voice model unavailable: {e:#}");
-                terminate(&handle).await;
-                return self.calls.finish(
-                    id,
-                    Status::Failed,
-                    format!("voice model unavailable: {e:#}"),
-                );
+        let connecting = Instant::now();
+        let (core, setup) = match self.start_core(id, &info).await {
+            Some((core, ctx)) => (Some(core), self.core_setup(ctx)),
+            None => (None, self.setup(&info.context)),
+        };
+        let mut live =
+            match Live::connect(&self.cfg.gemini_url, &self.cfg.gemini_api_key, setup).await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!("call {id}: voice model unavailable: {e:#}");
+                    line.hang_up().await;
+                    self.calls.update(id, |r| r.metrics.ended_by = "error");
+                    return self.calls.finish(
+                        id,
+                        Status::Failed,
+                        format!("voice model unavailable: {e:#}"),
+                    );
+                }
+            };
+        log::info!(
+            "call {id}: voice model ready {:.2}s after answer",
+            connecting.elapsed().as_secs_f32()
+        );
+        live.send_text(&info.opening);
+
+        // Core session: the call is written back to the owner's DM session as it happens, in order,
+        // and text messages that arrive meanwhile come back as context for the model.
+        let (events, mut news_rx, writer) = match &core {
+            Some(core) => {
+                let (tx, rx) = mpsc::unbounded_channel::<Value>();
+                let (news_tx, news_rx) = mpsc::unbounded_channel::<String>();
+                (
+                    Some(tx),
+                    news_rx,
+                    Some(tokio::spawn(write_back(core.clone(), rx, news_tx))),
+                )
+            }
+            None => (None, mpsc::unbounded_channel().1, None),
+        };
+        let emit = |event: Value| {
+            if let Some(tx) = &events {
+                let _ = tx.send(event);
             }
         };
-        live.send_text(opening);
 
         // Model speech goes out on a fixed 60 ms clock; the library does not pace for us.
         let playout = Arc::new(Playout::default());
@@ -625,40 +898,71 @@ impl Bridge {
         });
 
         let mut down = Downsampler::new();
-        let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<ToolDone>();
         let mut tool_tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
-        let mut ending = Ending::new(self.cfg.silence_timeout);
+        let mut ending = Ending::new(self.cfg.silence_timeout, self.cfg.hangup_grace);
+        let mut pacing = Pacing::new(self.cfg.max_silent_tools);
+        let mut timeline = Timeline::new(connecting);
+        let mut recorder = self.cfg.recordings.as_ref().and_then(|dir| {
+            std::fs::create_dir_all(dir)
+                .and_then(|_| WavWriter::create(&dir.join(format!("{id}.wav")), 16_000))
+                .map_err(|e| log::warn!("call {id}: cannot record the owner's audio: {e}"))
+                .ok()
+        });
+        // Texts the owner sends during a core-session call come here instead of the text agent.
+        let (text_tx, mut text_rx) = mpsc::unbounded_channel::<String>();
+        if core.is_some() {
+            *self.texts.lock().unwrap() = Some(text_tx);
+        }
         let mut check = tokio::time::interval(Duration::from_millis(200));
         let max_duration = tokio::time::sleep(self.cfg.max_duration);
-        let ended = handle.wait_ended();
+        let ended = line.ended();
         tokio::pin!(max_duration, ended);
 
-        let mut peer_ended = false;
-        let end_reason = loop {
+        let (end_reason, ended_by) = loop {
             tokio::select! {
-                _ = &mut ended => {
-                    peer_ended = true;
-                    break "call ended".to_string();
-                }
-                _ = &mut max_duration => break "maximum call length reached".to_string(),
+                _ = &mut ended => break ("call ended".to_string(), "phone"),
+                _ = &mut max_duration => break ("maximum call length reached".to_string(), "limit"),
                 frame = spk_rx.recv() => match frame {
-                    Ok(f) => live.send_audio(&f),
-                    Err(_) => {
-                        peer_ended = true;
-                        break "call audio closed".to_string();
+                    Ok(f) => {
+                        if let Some(w) = &mut recorder {
+                            let _ = w.write(&f);
+                        }
+                        live.send_audio(&f);
                     }
+                    Err(_) => break ("call audio closed".to_string(), "phone"),
                 },
-                Some((tool_id, result)) = tool_rx.recv() => {
+                Some((tool_id, name, result)) = tool_rx.recv() => {
                     tool_tasks.remove(&tool_id);
-                    live.send_tool_response(&tool_id, "ask_hermes", result, "WHEN_IDLE");
+                    pacing.result_sent();
+                    emit(json!({"type": "tool_result", "id": tool_id, "name": name, "result": result_text(&result)}));
+                    live.send_tool_response(&tool_id, &name, result, "WHEN_IDLE");
+                }
+                Some(news) = news_rx.recv() => live.add_context(&news),
+                Some(text) = text_rx.recv() => {
+                    log::info!("call {id}: owner texted during the call");
+                    if ending.owner_spoke(Instant::now()) {
+                        live.send_text(STILL_CONNECTED);
+                    }
+                    emit(json!({"type": "owner_text", "text": text}));
+                    self.calls.update(id, |r| r.append("owner", &format!(" (texted) {text} ")));
+                    live.send_text(&format!("(The owner just texted you this during the call: {text})"));
                 }
                 _ = check.tick() => {
-                    if let Some(why) = ending.check(Instant::now(), playout.buffered() > 0, !tool_tasks.is_empty()) {
-                        break why.to_string();
+                    let playing = playout.buffered() > 0;
+                    if playing {
+                        timeline.sound(Instant::now());
+                    }
+                    if let Some(why) = ending.check(Instant::now(), playing, !tool_tasks.is_empty()) {
+                        let by = if why.starts_with("assistant") { "assistant" } else { "silence" };
+                        break (why.to_string(), by);
                     }
                 }
                 ev = live.events.recv() => match ev {
-                    Some(LiveEvent::Audio(pcm)) => playout.push(&down.process(&pcm)),
+                    Some(LiveEvent::Audio(pcm)) => {
+                        timeline.model_audio(Instant::now());
+                        playout.push(&down.process(&pcm));
+                    }
                     Some(LiveEvent::Interrupted) => {
                         playout.clear();
                         if ending.owner_spoke(Instant::now()) {
@@ -666,14 +970,27 @@ impl Bridge {
                         }
                     }
                     Some(LiveEvent::InputTranscript(t)) => {
+                        timeline.owner_spoke(Instant::now());
                         if ending.owner_spoke(Instant::now()) {
                             live.send_text(STILL_CONNECTED);
                         }
+                        emit(json!({"type": "owner", "text": t}));
                         self.calls.update(id, |r| r.append("owner", &t));
                     }
-                    Some(LiveEvent::OutputTranscript(t)) => self.calls.update(id, |r| r.append("assistant", &t)),
+                    Some(LiveEvent::OutputTranscript(t)) => {
+                        pacing.spoke();
+                        timeline.model_spoke();
+                        emit(json!({"type": "assistant", "text": t}));
+                        self.calls.update(id, |r| r.append("assistant", &t));
+                    }
+                    Some(LiveEvent::TurnComplete) => emit(json!({"type": "turn_complete"})),
+                    Some(LiveEvent::Usage { prompt, response }) => {
+                        timeline.m.prompt_tokens += prompt;
+                        timeline.m.response_tokens += response;
+                    }
                     Some(LiveEvent::ToolCall { id: tool_id, name, args }) => match name.as_str() {
-                        "ask_hermes" => {
+                        "ask_hermes" if core.is_none() => {
+                            timeline.tool();
                             log::info!("call {id}: ask_hermes {}", args["request"]);
                             let task = self.spawn_ask_hermes(&tool_id, id, &args, tool_tx.clone());
                             tool_tasks.insert(tool_id, task);
@@ -683,37 +1000,111 @@ impl Bridge {
                             if self.calls.get(id).is_some_and(|r| r.ends_with_question()) {
                                 live.send_tool_response(&tool_id, &name, json!({"error":
                                     "You just asked the owner a question. Wait for their answer, and end the call only after they say bye."}), "SILENT");
+                            } else if pacing.owes_report {
+                                live.send_tool_response(&tool_id, &name, json!({"error":
+                                    "Tell the owner what came of your last tools first (done, failed, or still open), then end the call only once they are done."}), "SILENT");
                             } else {
                                 live.send_tool_response(&tool_id, &name, json!({"ok": true}), "SILENT");
                                 ending.request();
                             }
                         }
-                        _ => live.send_tool_response(&tool_id, &name, json!({"error": "unknown function"}), "WHEN_IDLE"),
+                        _ => match &core {
+                            Some(_) if !pacing.allow_tool() => {
+                                log::info!("call {id}: tool {name} held back until the model speaks");
+                                live.send_tool_response(&tool_id, &name, json!({"error":
+                                    "You have run several tools without saying anything. Tell the owner briefly what you are doing or what you found, then continue."}), "WHEN_IDLE");
+                            }
+                            Some(core) => {
+                                timeline.tool();
+                                log::info!("call {id}: tool {name} {}", truncate(&args.to_string(), 200));
+                                emit(json!({"type": "tool_call", "id": tool_id, "name": name, "args": args}));
+                                let (core, done, tid) = (core.clone(), tool_tx.clone(), tool_id.clone());
+                                let task = tokio::spawn(async move {
+                                    let started = Instant::now();
+                                    let result = core.call_tool(&tid, &name, &args).await;
+                                    log::info!("tool {name} answered in {:.2}s", started.elapsed().as_secs_f32());
+                                    let _ = done.send((tid, name, result));
+                                });
+                                tool_tasks.insert(tool_id, task);
+                            }
+                            None => live.send_tool_response(&tool_id, &name, json!({"error": "unknown function"}), "WHEN_IDLE"),
+                        },
                     },
                     Some(LiveEvent::ToolCancelled(ids)) => {
                         for tool_id in ids {
                             if let Some(task) = tool_tasks.remove(&tool_id) {
                                 task.abort();
+                                emit(json!({"type": "tool_result", "id": tool_id, "result": "(cancelled)"}));
                             }
                         }
                     }
-                    Some(LiveEvent::Closed(why)) => break format!("voice model disconnected: {why}"),
-                    None => break "voice model stopped".to_string(),
+                    Some(LiveEvent::Closed(why)) => break (format!("voice model disconnected: {why}"), "voice_model"),
+                    None => break ("voice model stopped".to_string(), "voice_model"),
                 },
             }
         };
 
+        *self.texts.lock().unwrap() = None;
         pacer.abort();
         tool_tasks.values().for_each(JoinHandle::abort);
         drop(live);
-        if !peer_ended {
-            terminate(&handle).await;
+        if ended_by != "phone" {
+            line.hang_up().await;
         }
-        log::info!("call {id}: {end_reason}");
+        if let Some(w) = recorder
+            && let Err(e) = w.finish()
+        {
+            log::warn!("call {id}: could not save the recording: {e}");
+        }
+        timeline.m.ended_by = ended_by;
+        log::info!("call {id}: {end_reason} ({:?})", timeline.m);
+        self.calls.update(id, |r| r.metrics = timeline.m);
         self.calls.finish(id, Status::Completed, end_reason);
+        if let (Some(core), Some(writer)) = (core, writer) {
+            drop(events);
+            // Writes go on after the summary; they wait for the session lock if Hermes is busy.
+            let call = id.to_string();
+            tokio::spawn(async move {
+                let _ = writer.await;
+                match core.end().await {
+                    Ok(n) => log::info!("call {call}: {n} messages saved to the chat session"),
+                    Err(e) => log::warn!(
+                        "call {call}: could not save the call to the chat session: {e:#}"
+                    ),
+                }
+            });
+            return self.send_core_summary(id).await;
+        }
         self.send_summary(id).await;
         // Memory may have changed during the call (e.g. a new preference); the next call should know.
         self.refresh_persona().await;
+    }
+
+    /// Core-session calls are already in the chat history; the owner just gets a short note.
+    async fn send_core_summary(&self, id: &str) {
+        let Some(record) = self.calls.get(id) else {
+            return;
+        };
+        if !self.cfg.send_summary || record.transcript.is_empty() {
+            return;
+        }
+        let minutes = record
+            .answered_at
+            .zip(record.ended_at)
+            .map(|(a, e)| e.saturating_sub(a).div_ceil(60))
+            .unwrap_or(0);
+        let text = format!("📞 Call ended ({minutes} min). It's saved in this chat.");
+        self.message_owner(id, text).await;
+    }
+
+    async fn message_owner(&self, id: &str, text: String) {
+        let Some(client) = &self.client else { return };
+        if let Err(e) = client
+            .send_message(&self.owner_jid(), wa::Message::text(text))
+            .await
+        {
+            log::warn!("call {id}: could not send summary: {e}");
+        }
     }
 
     /// After a call: let Hermes digest the transcript, then message the owner a summary.
@@ -765,13 +1156,7 @@ impl Bridge {
             "📞 Call summary ({minutes} min):\n{}",
             truncate(&summary, 3500)
         );
-        if let Err(e) = self
-            .client
-            .send_message(&self.owner_jid(), wa::Message::text(text))
-            .await
-        {
-            log::warn!("call {id}: could not send summary: {e}");
-        }
+        self.message_owner(id, text).await;
     }
 }
 
@@ -801,6 +1186,43 @@ fn system_instruction(
     )
 }
 
+fn end_call_function() -> Value {
+    json!({
+        "name": "end_call",
+        "description": "Hang up the call. Call it only after you have said goodbye.",
+        "behavior": "NON_BLOCKING",
+    })
+}
+
+/// A tool response as text for the chat history.
+fn result_text(result: &Value) -> String {
+    match result.get("result").and_then(Value::as_str) {
+        Some(text) => text.to_string(),
+        None => result.to_string(),
+    }
+}
+
+/// Posts call events to the core session in order, batching whatever piled up meanwhile.
+async fn write_back(
+    core: Core,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    news: mpsc::UnboundedSender<String>,
+) {
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+        match core.events(batch).await {
+            Ok(text) if !text.is_empty() => {
+                let _ = news.send(text);
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("could not save call events: {e:#}"),
+        }
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -819,6 +1241,9 @@ async fn terminate(handle: &CallHandle) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod sim;
 
 #[cfg(test)]
 mod tests {
@@ -896,7 +1321,7 @@ mod tests {
     fn ending_waits_for_the_goodbye_to_play_then_a_quiet_window() {
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
-        let mut e = Ending::new(Duration::from_secs(30));
+        let mut e = Ending::new(Duration::from_secs(30), Duration::from_secs(3));
         assert_eq!(e.check(t0, false, false), None);
 
         e.request();
@@ -921,7 +1346,7 @@ mod tests {
     fn owner_speech_calls_the_hangup_off() {
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
-        let mut e = Ending::new(Duration::from_secs(30));
+        let mut e = Ending::new(Duration::from_secs(30), Duration::from_secs(3));
         assert!(!e.owner_spoke(t0), "nothing to call off before end_call");
 
         e.request();
@@ -934,10 +1359,23 @@ mod tests {
     }
 
     #[test]
+    fn pacing_makes_the_model_speak_between_tools_and_before_hanging_up() {
+        let mut pacing = Pacing::new(5);
+        for _ in 0..5 {
+            assert!(pacing.allow_tool());
+        }
+        assert!(!pacing.allow_tool(), "too many tools in silence");
+        pacing.result_sent();
+        assert!(pacing.owes_report, "results not told to the owner yet");
+        pacing.spoke();
+        assert!(pacing.allow_tool() && !pacing.owes_report);
+    }
+
+    #[test]
     fn silence_ends_an_unclosed_call_unless_hermes_is_working() {
         let t0 = Instant::now();
         let at = |s| t0 + Duration::from_secs(s);
-        let mut e = Ending::new(Duration::from_secs(30));
+        let mut e = Ending::new(Duration::from_secs(30), Duration::from_secs(3));
         e.owner_spoke(t0);
         assert_eq!(e.check(at(29), false, false), None);
         assert_eq!(e.check(at(31), false, true), None, "waiting on ask_hermes");

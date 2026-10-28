@@ -1,7 +1,7 @@
 name: hermes-whatsapp-voice
 label: WhatsApp Voice Calls
 kind: standalone
-version: 0.1.12
+version: 0.2.0
 manifest_version: 2
 api_version: 1
 description: >-
@@ -27,6 +27,12 @@ optional_env:
     description: "Hermes API server key; lets the voice agent hand real work to Hermes during a call"
     secret: true
 config_schema:
+  context_mode:
+    type: str
+    default: "separate"
+    choices: ["separate", "core_session"]
+    label: "Call context"
+    description: "separate: a small voice agent with a short briefing that asks Hermes for help (cheapest). core_session: the voice is the model of your WhatsApp chat with Hermes (same prompt, history and tools; the call is saved into that chat); every reply re-reads that context, so calls cost several times more."
   owner_number:
     type: str
     default: ""
@@ -52,7 +58,13 @@ config_schema:
     type: str
     default: ""
     label: "Languages"
-    description: "Comma-separated language codes the voice may speak and listen for, e.g. en-US, ta-IN. Empty: any language."
+    description: "Comma-separated language codes the voice may speak, e.g. en-US, ta-IN. Speech recognition takes them only as hints; if it mishears you, also set Main spoken language. Empty: any language."
+  speech_language:
+    type: str
+    default: ""
+    choices: ["", "en-US", "en-IN", "en-GB", "en-AU", "ta-IN", "hi-IN", "te-IN", "kn-IN", "ml-IN", "mr-IN", "bn-IN", "gu-IN", "de-DE", "es-US", "es-ES", "fr-FR", "fr-CA", "it-IT", "pt-BR", "nl-NL", "pl-PL", "ru-RU", "tr-TR", "ar-XA", "id-ID", "vi-VN", "th-TH", "ja-JP", "ko-KR", "cmn-CN"]
+    label: "Main spoken language"
+    description: "The language you mostly speak on calls. Gemini uses it to recognise your speech and for its own voice, and it is much stronger than the Languages hints. Blank lets Gemini detect it."
   voice_instructions:
     type: str
     default: ""
@@ -73,6 +85,31 @@ config_schema:
     default: 180
     label: "Hang up after silence (seconds)"
     description: "Ends a call when nobody has spoken for this long, e.g. left on hold."
+  pause_before_reply_ms:
+    type: int
+    default: 600
+    label: "Pause before it replies (ms)"
+    description: "How long you can pause mid-sentence before the voice takes it that you have finished and answers. Raise it if it cuts you off; lower it for snappier replies."
+  hangup_grace_seconds:
+    type: int
+    default: 3
+    label: "Hang up after goodbye (seconds)"
+    description: "Quiet time after the assistant's goodbye before it hangs up. Speaking in that time keeps the call going."
+  hermes_timeout_seconds:
+    type: int
+    default: 180
+    label: "Hermes time limit (seconds)"
+    description: "How long the voice waits for Hermes on one request (and for the call summary) before giving up."
+  max_silent_tools:
+    type: int
+    default: 5
+    label: "Tools before speaking"
+    description: "How many tools the voice may run in a row before it must tell you what it is doing."
+  record_calls:
+    type: bool
+    default: false
+    label: "Record my side of calls"
+    description: "Save your audio from each call as a WAV file in the plugin's data folder (recordings/), on this machine only. For testing and debugging; off by default."
   answer_inbound:
     type: bool
     default: true
@@ -83,6 +120,21 @@ config_schema:
     default: true
     label: "Send call summary"
     description: "Message a short WhatsApp summary after each call."
+  voice_tools:
+    type: str
+    default: "memory, session_search, skills_list, skill_view, web_search, web_extract, read_file, search_files, todo_list, hindsight_recall, hindsight_retain, hindsight_reflect"
+    label: "Voice tools"
+    description: "core_session: comma-separated Hermes tools the voice uses itself for quick lookups. Real jobs (commands, changes, multi-step work) go to your main model through ask_hermes_deep."
+  history_chars:
+    type: int
+    default: 30000
+    label: "Chat history for calls (characters)"
+    description: "core_session: how much recent chat history the voice gets at the start of a call."
+  vocabulary:
+    type: str
+    default: ""
+    label: "Spellings"
+    description: "Comma-separated words transcripts should spell as given, e.g. names. Your own name is added automatically."
   live_config:
     type: dict
     default: {}
@@ -93,6 +145,16 @@ config_schema:
     default: "127.0.0.1:8796"
     label: "Sidecar address"
     description: "Loopback address of the sidecar's local API."
+  context_listen:
+    type: str
+    default: "127.0.0.1:8797"
+    label: "Core session address"
+    description: "core_session: loopback address of the plugin's context service."
+  voice_api_url:
+    type: str
+    default: "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    label: "Voice model endpoint"
+    description: "Gemini Live WebSocket URL. Change only to use a proxy."
   hermes_api_url:
     type: str
     default: "http://127.0.0.1:8642"

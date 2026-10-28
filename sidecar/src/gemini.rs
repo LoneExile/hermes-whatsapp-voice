@@ -22,12 +22,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::audio::{i16_to_le_bytes, le_bytes_to_i16};
 
-const ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+pub const ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 const MAX_RECONNECTS: u32 = 3;
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Setup {
     pub model: String,
     pub voice: String,
@@ -35,8 +35,17 @@ pub struct Setup {
     pub functions: Vec<Value>,
     /// Language codes to pin speech recognition to; empty lets Gemini detect the language.
     pub languages: Vec<String>,
+    /// The language the owner speaks (`speechConfig.languageCode`), which Gemini uses for both
+    /// recognition and the voice; stronger than the `languages` hints. Empty leaves it unset.
+    pub speech_language: String,
+    /// How long the owner may pause before their turn counts as over and the model replies.
+    pub pause_ms: u32,
     /// Owner-supplied setup fields (the `live_config` setting), merged over the defaults.
     pub overrides: Value,
+    /// Earlier conversation as `Content` turns, loaded before the call starts (not on resume).
+    pub history: Vec<Value>,
+    /// Words transcription should spell as given, e.g. the owner's name.
+    pub vocabulary: Vec<String>,
 }
 
 /// Deep-merges `over` into `base`: objects merge key by key, anything else replaces.
@@ -69,14 +78,10 @@ impl Setup {
                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": self.voice}}},
             },
             "systemInstruction": {"parts": [{"text": self.system_instruction}]},
-            "inputAudioTranscription": if self.languages.is_empty() {
-                json!({})
-            } else {
-                json!({"languageCodes": self.languages})
-            },
-            "outputAudioTranscription": {},
+            "inputAudioTranscription": self.transcription(true),
+            "outputAudioTranscription": self.transcription(false),
             "realtimeInputConfig": {
-                "automaticActivityDetection": {"silenceDurationMs": 600},
+                "automaticActivityDetection": {"silenceDurationMs": self.pause_ms},
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
             },
             "contextWindowCompression": {"slidingWindow": {}},
@@ -85,11 +90,31 @@ impl Setup {
                 None => json!({}),
             },
         });
+        if !self.speech_language.is_empty() {
+            setup["generationConfig"]["speechConfig"]["languageCode"] = json!(self.speech_language);
+        }
         if !self.functions.is_empty() {
             setup["tools"] = json!([{"functionDeclarations": self.functions}]);
         }
-        merge(&mut setup, &self.overrides);
+        // A resumed session already holds the history.
+        if !self.history.is_empty() && resume_handle.is_none() {
+            setup["historyConfig"] = json!({"initialHistoryInClientContent": true});
+        }
+        if self.overrides.is_object() {
+            merge(&mut setup, &self.overrides);
+        }
         json!({"setup": setup})
+    }
+
+    fn transcription(&self, input: bool) -> Value {
+        let mut config = json!({});
+        if input && !self.languages.is_empty() {
+            config["languageCodes"] = json!(self.languages);
+        }
+        if !self.vocabulary.is_empty() {
+            config["customVocabulary"] = json!(self.vocabulary);
+        }
+        config
     }
 }
 
@@ -107,6 +132,13 @@ pub enum LiveEvent {
         args: Value,
     },
     ToolCancelled(Vec<String>),
+    /// The model finished its turn.
+    TurnComplete,
+    /// Tokens billed for one model response.
+    Usage {
+        prompt: u64,
+        response: u64,
+    },
     /// The session ended for good; carries the reason.
     Closed(String),
 }
@@ -156,6 +188,9 @@ fn parse_server_message(msg: &Value) -> Parsed {
             p.events.push(LiveEvent::OutputTranscript(t.to_string()));
         }
         p.turn_complete = sc["turnComplete"].as_bool() == Some(true);
+        if p.turn_complete {
+            p.events.push(LiveEvent::TurnComplete);
+        }
     }
     for fc in msg["toolCall"]["functionCalls"]
         .as_array()
@@ -182,6 +217,12 @@ fn parse_server_message(msg: &Value) -> Parsed {
         p.resume_handle = Some(h.to_string());
     }
     p.go_away = msg.get("goAway").map(|g| parse_time_left(&g["timeLeft"]));
+    if let Some(u) = msg.get("usageMetadata") {
+        p.events.push(LiveEvent::Usage {
+            prompt: u["promptTokenCount"].as_u64().unwrap_or(0),
+            response: u["responseTokenCount"].as_u64().unwrap_or(0),
+        });
+    }
     p
 }
 
@@ -198,11 +239,25 @@ pub struct Live {
 }
 
 impl Live {
-    pub async fn connect(api_key: &str, setup: Setup) -> Result<Self> {
-        let ws = open(api_key, &setup.message(None)).await?;
+    pub async fn connect(url: &str, api_key: &str, setup: Setup) -> Result<Self> {
+        let mut ws = open(url, api_key, &setup.message(None)).await?;
+        if !setup.history.is_empty() {
+            // With initialHistoryInClientContent the server takes this as context, not a prompt.
+            let history = json!({"clientContent": {"turns": setup.history, "turnComplete": true}});
+            ws.send(Message::text(history.to_string()))
+                .await
+                .context("sending call history to Gemini Live")?;
+        }
         let (outbox, out_rx) = mpsc::unbounded_channel();
         let (ev_tx, events) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run(api_key.to_string(), setup, ws, out_rx, ev_tx));
+        let task = tokio::spawn(run(
+            url.to_string(),
+            api_key.to_string(),
+            setup,
+            ws,
+            out_rx,
+            ev_tx,
+        ));
         Ok(Self {
             outbox,
             events,
@@ -227,6 +282,14 @@ impl Live {
         self.send(json!({"realtimeInput": {"text": text}}));
     }
 
+    /// Adds context without prompting a reply (e.g. a text message that arrived mid-call).
+    pub fn add_context(&self, text: &str) {
+        self.send(json!({"clientContent": {
+            "turns": [{"role": "user", "parts": [{"text": text}]}],
+            "turnComplete": false,
+        }}));
+    }
+
     /// `scheduling` applies to non-blocking functions: "INTERRUPT", "WHEN_IDLE" or "SILENT".
     pub fn send_tool_response(&self, id: &str, name: &str, response: Value, scheduling: &str) {
         self.send(json!({"toolResponse": {"functionResponses": [{
@@ -241,8 +304,8 @@ impl Drop for Live {
     }
 }
 
-async fn open(api_key: &str, setup: &Value) -> Result<Ws> {
-    let mut req = ENDPOINT.into_client_request()?;
+async fn open(url: &str, api_key: &str, setup: &Value) -> Result<Ws> {
+    let mut req = url.into_client_request()?;
     req.headers_mut().insert("x-goog-api-key", api_key.parse()?);
     let (mut ws, _) = tokio::time::timeout(
         Duration::from_secs(15),
@@ -359,6 +422,7 @@ async fn pump(
 }
 
 async fn run(
+    url: String,
     api_key: String,
     setup: Setup,
     mut ws: Ws,
@@ -386,8 +450,11 @@ async fn run(
             return;
         };
         log::info!("gemini: {why}; resuming session");
+        // After goAway the old socket is still open, and the server refuses to resume a session
+        // that is still connected ("already connected to an existing client").
+        let _ = tokio::time::timeout(Duration::from_secs(2), ws.close(None)).await;
         loop {
-            match open(&api_key, &setup.message(Some(&handle))).await {
+            match open(&url, &api_key, &setup.message(Some(&handle))).await {
                 Ok(next) => {
                     ws = next;
                     failures = 0;
@@ -450,6 +517,7 @@ mod tests {
         assert_eq!(
             p.events,
             vec![
+                LiveEvent::TurnComplete,
                 LiveEvent::ToolCall {
                     id: "c1".into(),
                     name: "ask_hermes".into(),
@@ -461,6 +529,18 @@ mod tests {
         assert_eq!(p.resume_handle.as_deref(), Some("h2"));
         assert!(p.turn_complete);
         assert_eq!(p.go_away, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn reports_token_usage() {
+        let msg = json!({"usageMetadata": {"promptTokenCount": 1200, "responseTokenCount": 80, "totalTokenCount": 1280}});
+        assert_eq!(
+            parse_server_message(&msg).events,
+            vec![LiveEvent::Usage {
+                prompt: 1200,
+                response: 80
+            }]
+        );
     }
 
     #[test]
@@ -477,12 +557,15 @@ mod tests {
             system_instruction: "be brief".into(),
             functions: vec![json!({"name": "end_call"})],
             languages: vec!["en-US".into(), "ta-IN".into()],
+            speech_language: String::new(),
+            pause_ms: 600,
             overrides: json!({
                 "generationConfig": {"temperature": 0.4, "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": "Puck"}}}},
                 "realtimeInputConfig": {"automaticActivityDetection": {"silenceDurationMs": 900}},
                 "inputAudioTranscription": {"languageCodes": ["ta-IN", "en-US"]},
                 "tools": [{"googleSearch": {}}],
             }),
+            ..Default::default()
         };
         let m = &setup.message(None)["setup"];
         let gen_cfg = &m["generationConfig"];
@@ -526,11 +609,45 @@ mod tests {
             functions: vec![],
             languages: vec!["en-US".into(), "ta-IN".into()],
             overrides: json!({}),
+            ..Default::default()
         };
         let m = &setup.message(None)["setup"];
         assert_eq!(
             m["inputAudioTranscription"]["languageCodes"],
             json!(["en-US", "ta-IN"])
+        );
+        assert!(m["generationConfig"]["speechConfig"]["languageCode"].is_null());
+
+        let setup = Setup {
+            voice: "v".into(),
+            speech_language: "ta-IN".into(),
+            ..setup
+        };
+        let speech = &setup.message(None)["setup"]["generationConfig"]["speechConfig"];
+        assert_eq!(speech["languageCode"], "ta-IN");
+        assert_eq!(
+            speech["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            "v"
+        );
+    }
+
+    #[test]
+    fn history_and_vocabulary_go_into_setup() {
+        let setup = Setup {
+            languages: vec!["en-US".into()],
+            history: vec![json!({"role": "user", "parts": [{"text": "hi"}]})],
+            vocabulary: vec!["Zephyrine".into()],
+            ..Default::default()
+        };
+        let m = &setup.message(None)["setup"];
+        assert_eq!(m["historyConfig"]["initialHistoryInClientContent"], true);
+        assert_eq!(
+            m["inputAudioTranscription"],
+            json!({"languageCodes": ["en-US"], "customVocabulary": ["Zephyrine"]})
+        );
+        assert_eq!(
+            m["outputAudioTranscription"],
+            json!({"customVocabulary": ["Zephyrine"]})
         );
     }
 
@@ -542,9 +659,17 @@ mod tests {
             system_instruction: "be brief".into(),
             functions: vec![json!({"name": "end_call"})],
             languages: vec![],
+            speech_language: String::new(),
+            pause_ms: 750,
             overrides: json!({}),
+            history: vec![json!({"role": "user", "parts": [{"text": "hi"}]})],
+            vocabulary: vec![],
         };
         let m = setup.message(Some("h1"));
+        assert!(
+            m["setup"].get("historyConfig").is_none(),
+            "a resumed session already has its history"
+        );
         assert_eq!(m["setup"]["model"], "models/gemini-3.8-live");
         assert_eq!(m["setup"]["sessionResumption"]["handle"], "h1");
         assert_eq!(
@@ -554,6 +679,10 @@ mod tests {
         assert_eq!(
             m["setup"]["generationConfig"]["responseModalities"][0],
             "AUDIO"
+        );
+        assert_eq!(
+            m["setup"]["realtimeInputConfig"]["automaticActivityDetection"]["silenceDurationMs"],
+            750
         );
     }
 
@@ -571,18 +700,27 @@ mod tests {
                 json!({"name": "end_call", "description": "Hang up.", "behavior": "NON_BLOCKING"}),
             ],
             languages: vec![],
+            speech_language: String::new(),
+            pause_ms: 600,
             overrides: std::env::var("HWV_LIVE_CONFIG")
                 .map(|raw| serde_json::from_str(&raw).expect("HWV_LIVE_CONFIG JSON"))
                 .unwrap_or_else(|_| json!({})),
+            // Checks that the API takes history and vocabulary, and that the model uses the history.
+            history: vec![
+                json!({"role": "user", "parts": [{"text": "My favourite colour is teal."}]}),
+                json!({"role": "model", "parts": [{"text": "Got it, teal."}]}),
+            ],
+            vocabulary: vec!["Zephyrine".into()],
         };
-        let mut live = Live::connect(&key, setup).await.expect("connect");
-        live.send_text("Say hello.");
+        let mut live = Live::connect(ENDPOINT, &key, setup).await.expect("connect");
+        live.send_text("What is my favourite colour?");
         let (mut audio, mut transcript) = (0usize, String::new());
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while audio < 24_000 || transcript.is_empty() {
+        loop {
             match tokio::time::timeout_at(deadline, live.events.recv()).await {
                 Ok(Some(LiveEvent::Audio(pcm))) => audio += pcm.len(),
                 Ok(Some(LiveEvent::OutputTranscript(t))) => transcript.push_str(&t),
+                Ok(Some(LiveEvent::TurnComplete)) if !transcript.is_empty() => break,
                 Ok(Some(LiveEvent::Closed(why))) => panic!("closed: {why}"),
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => break,
@@ -592,6 +730,10 @@ mod tests {
         assert!(
             audio >= 24_000,
             "expected at least 1s of speech, got {audio} samples"
+        );
+        assert!(
+            transcript.to_lowercase().contains("teal"),
+            "history not used: {transcript:?}"
         );
     }
 }

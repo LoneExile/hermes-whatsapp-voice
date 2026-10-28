@@ -22,18 +22,31 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 
 # Settings forwarded to the sidecar, with the defaults from plugin.yaml.
 SETTINGS: dict[str, Any] = {
+    "context_mode": "separate",
     "owner_number": "",
     "voice_model": "gemini-3.8-live",
     "voice": "Kore",
     "assistant_name": "Hermes",
     "languages": "",
+    "speech_language": "",
     "voice_instructions": "",
+    "voice_tools": "memory, session_search, skills_list, skill_view, web_search, web_extract, read_file, "
+    "search_files, todo_list, hindsight_recall, hindsight_retain, hindsight_reflect",
+    "history_chars": 30000,
+    "vocabulary": "",
     "live_config": {},
     "listen": "127.0.0.1:8796",
+    "context_listen": "127.0.0.1:8797",
     "hermes_api_url": "http://127.0.0.1:8642",
     "ring_timeout_seconds": 45,
     "max_call_minutes": 15,
     "silence_hangup_seconds": 180,
+    "pause_before_reply_ms": 600,
+    "hangup_grace_seconds": 3,
+    "hermes_timeout_seconds": 180,
+    "max_silent_tools": 5,
+    "record_calls": False,
+    "voice_api_url": "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
     "answer_inbound": True,
     "send_summary": True,
 }
@@ -149,14 +162,23 @@ def sidecar_env(ctx) -> dict[str, str]:
         "HWV_VOICE": str(s["voice"]),
         "HWV_ASSISTANT_NAME": str(s["assistant_name"]),
         "HWV_LANGUAGES": str(s["languages"]),
+        "HWV_SPEECH_LANGUAGE": str(s["speech_language"]),
         "HWV_VOICE_INSTRUCTIONS": str(s["voice_instructions"]),
         "HWV_LIVE_CONFIG": json.dumps(s["live_config"] or {}),
         "HWV_LISTEN": str(s["listen"]),
         "HWV_RING_TIMEOUT": f"{int(s['ring_timeout_seconds'])}s",
         "HWV_MAX_DURATION": f"{int(s['max_call_minutes'])}m",
         "HWV_SILENCE_TIMEOUT": f"{int(s['silence_hangup_seconds'])}s",
+        "HWV_PAUSE_MS": str(int(s["pause_before_reply_ms"])),
+        "HWV_HANGUP_GRACE": f"{int(s['hangup_grace_seconds'])}s",
+        "HWV_HERMES_TIMEOUT": f"{int(s['hermes_timeout_seconds'])}s",
+        "HWV_MAX_SILENT_TOOLS": str(int(s["max_silent_tools"])),
+        "HWV_RECORD_CALLS": "true" if s["record_calls"] else "false",
+        "HWV_GEMINI_URL": str(s["voice_api_url"]),
         "HWV_ANSWER_INBOUND": "true" if s["answer_inbound"] else "false",
         "HWV_SEND_SUMMARY": "true" if s["send_summary"] else "false",
+        "HWV_VOCABULARY": str(s["vocabulary"]),
+        "HWV_CONTEXT_URL": f"http://{s['context_listen']}" if s["context_mode"] == "core_session" else "",
         "HWV_DATA_DIR": str(data_dir()),
         "HWV_TOKEN": token(create=True),
         "HERMES_API_URL": str(s["hermes_api_url"]),
@@ -207,3 +229,11 @@ class Client:
 
     def recent_calls(self, limit: int = 5) -> list[dict]:
         return self._request("GET", f"/calls?limit={limit}").get("calls", [])
+
+    def text_into_call(self, text: str) -> bool:
+        """Hand an owner's text to the active core-session call; False if no call takes it."""
+        try:
+            self._request("POST", "/calls/active/text", {"text": text})
+            return True
+        except SidecarError:
+            return False

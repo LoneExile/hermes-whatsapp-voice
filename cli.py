@@ -85,7 +85,31 @@ def _pair(ctx, phone: str | None) -> None:
 def _serve(ctx) -> None:
     exe = _require_ready(ctx)
     env = {**os.environ, **sidecar_env(ctx)}
-    os.execve(str(exe), [str(exe), "serve"], env)
+    s = settings(ctx)
+    if s["context_mode"] != "core_session":
+        os.execve(str(exe), [str(exe), "serve"], env)
+    # Core session: this process (Hermes's interpreter) serves the voice the owner's DM session,
+    # and runs the sidecar as a child.
+    import logging
+    import signal
+
+    from .core_session import Service
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    os.environ.setdefault("HERMES_EXEC_ASK", "1")  # approvals ask a human, as in the gateway
+    Service(
+        owner=str(s["owner_number"]),
+        token=env["HWV_TOKEN"],
+        voice_tools=str(s["voice_tools"]),
+        history_chars=int(s["history_chars"]),
+        voice_instructions=str(s["voice_instructions"]),
+        languages=[c.strip() for c in str(s["languages"]).split(",") if c.strip()],
+        vocabulary=[w.strip() for w in str(s["vocabulary"]).split(",") if w.strip()],
+    ).serve(str(s["context_listen"]))
+    child = subprocess.Popen([str(exe), "serve"], env=env)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+    raise SystemExit(child.wait())
 
 
 def _service() -> None:
@@ -138,6 +162,13 @@ def _call(ctx, reason: str) -> None:
         raise SystemExit(str(e)) from e
 
 
+def _calls(ctx, limit: int) -> None:
+    try:
+        print(json.dumps(Client.from_ctx(ctx).recent_calls(limit), indent=2))
+    except SidecarError as e:
+        raise SystemExit(str(e)) from e
+
+
 def setup_parser(subparser) -> None:
     subs = subparser.add_subparsers(dest="wv_command")
     install = subs.add_parser("install", help="Install the sidecar binary (release download, or build with Rust)")
@@ -149,6 +180,8 @@ def setup_parser(subparser) -> None:
     subs.add_parser("status", help="Show sidecar health")
     call = subs.add_parser("call", help="Place a test call to the owner")
     call.add_argument("reason", nargs="?", default="This is a quick test call.")
+    calls = subs.add_parser("calls", help="Show recent calls: transcript, end reason and timing metrics")
+    calls.add_argument("--limit", type=int, default=5)
 
 
 def make_handler(ctx):
@@ -166,7 +199,9 @@ def make_handler(ctx):
             _status(ctx)
         elif cmd == "call":
             _call(ctx, args.reason)
+        elif cmd == "calls":
+            _calls(ctx, args.limit)
         else:
-            print("Usage: hermes whatsapp-voice {install,pair,serve,service,status,call}", file=sys.stderr)
+            print("Usage: hermes whatsapp-voice {install,pair,serve,service,status,call,calls}", file=sys.stderr)
 
     return handle
