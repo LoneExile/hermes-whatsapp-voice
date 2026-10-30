@@ -1,6 +1,6 @@
 [package]
 name = "hermes-wa-voice"
-version = "0.2.2"
+version = "0.2.2-homelab.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
@@ -10,7 +10,9 @@ publish = false
 
 [dependencies]
 # Pinned: the VoIP API moves quickly upstream.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "135e1aebf9d62c06da17ae4516a90554a472c60e", features = ["voip"] }
+# 9b9fdb7e (#1098/#1794) sends the caller's relaylatency and transport: before it, calls the
+# sidecar placed never received the answering phone's audio (issue #15).
+whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "9b9fdb7e5c4211cdc7c837abb6a9ae9c597e35c5", features = ["voip"] }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 base64 = "0.22"
